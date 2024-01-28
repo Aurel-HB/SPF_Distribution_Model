@@ -1,0 +1,307 @@
+---
+title: "Printemps_tot"
+author: "Aurel"
+date: "2023-06-08"
+output: html_document
+---
+
+# we load the data
+```{r}
+local_path <- "C:/Users/ahebertb/Desktop/StageAurel/"
+source(paste(local_path,"code/script/boot.R",sep=""))
+
+data_model <- readRDS(paste(local_path,"code/data_model/anch_tot.rds", sep = ""))
+data_model <- data_model %>% filter(season == "spring")
+
+
+
+ggplot(study_domain_sf) + geom_sf() +
+  geom_point(data = data_model %>% filter(!is.na(indice)),
+             aes(x = Xgd, y = Ygd, color = indice), size = 1) +
+  labs(x = "", y = "", fill = "Occurence", 
+       title = "Carte de présence de l'anchois dans le Golfe de Gascogne par Pelgas") +
+  facet_wrap( ~ year, ncol = 7, nrow = 3) +
+  theme_bw()
+
+ggplot(study_domain_sf) + geom_sf() +
+  geom_point(data = data_model %>% filter(!is.na(biomass)), 
+  aes(x = Xgd, y = Ygd, color = biomass), size = 1) +
+  labs(x = "", y = "", fill = "Biomasse en kg", 
+       title = "Carte de densité de l'anchois dans le Golfe de Gascogne par Pelgas") +
+  facet_wrap( ~ year, ncol = 7, nrow = 3) +
+  theme_bw()
+
+ggplot(study_domain_sf) + geom_sf() +
+  geom_tile(data = data_model %>% filter(is.na(indice)),
+            aes(x = Xgd, y = Ygd, color = presence), size = 1) +
+  labs(x = "", y = "", fill = "Occurence", 
+       title = "Carte de présence de l'anchois dans le Golfe de Gascogne par la Pêche") +
+  facet_wrap( ~ year, ncol = 7, nrow = 3) +
+  theme_bw()
+```
+
+# Mesh construction
+```{r}
+
+plot(mesh_GdG)
+
+ggplot(study_domain_sf) + 
+  geom_sf() + 
+  theme_bw()
+
+
+```
+
+For the model we choose the mesh_GdG to allow comparaison
+
+# Create the space weigth and add it
+```{r}
+# It is necessary to represent the poisson point process
+
+space_weight <- create_space_weight(mesh_GdG, study_domain_sf)
+
+### this step is used only if you study_domain is not a single polygon
+### so some cells have been cut in several parts and we sum together this part
+ID <- c()
+area <- c()
+for (I in 1:mesh_GdG$n){
+  val <- space_weight %>%
+    filter(ID == I) %>%
+    colSums(.)
+  
+  ID <- c(ID,I)
+  area <- c(area, val[2])
+}
+space_weight <- data.frame(ID,area)
+
+df_weight <- add_weight(mesh_GdG, space_weight, data_model)
+
+data_model <- data_model %>%
+  mutate(weight = ifelse(survey == "PECHE", 0, 1)) %>%
+  st_cast()
+
+data_model <- rbind(data_model,df_weight)
+
+saveRDS(data_model, paste(local_path,"code/data_model/anch_tot.rds", sep = ""))
+
+
+```
+
+
+# Building the SPDE model on the mesh
+
+Now we use the inla.spde2.pcmatern() function to build the SPDE model
+and specify Penalised Complexity priors for the parameters of the Matérn
+field.
+
+```{r}
+
+spde <- inla.spde2.pcmatern(
+  mesh = mesh_GdG, 
+  alpha = 1.5,
+  prior.range = c(0.6, 0.1), # P(range < 0.6) = 0.1 (0.6 = 1.8/3)
+  prior.sigma = c(log(5) / 3, 0.01) # P(sigma > log(5) / 3) = 0.01
+  ) 
+
+```
+
+# Index set
+
+Now we construct the index set for the latent spatio-temporal Gaussian
+model
+
+```{r}
+timesn <- max(data_model$year) - min(data_model$year) + 1 #attention max(timesn) doit être = max(group)
+sn <- 1 # there is one season
+
+field.z.idx <- inla.spde.make.index(name = 'x', 
+  n.spde = spde$n.spde, n.group = 1)
+
+field.zc.idx <- inla.spde.make.index(name = 'xc', 
+  n.spde = spde$n.spde, n.group = timesn)
+
+field.y.idx <- inla.spde.make.index(name = 'u', 
+  n.spde = spde$n.spde, n.group = 1)
+
+field.p.idx <- inla.spde.make.index(name = 'p', 
+  n.spde = spde$n.spde, n.group = 1)
+
+lengths(field.z.idx)
+lengths(field.zc.idx)
+lengths(field.y.idx)
+lengths(field.p.idx)
+```
+# Projection matrix
+
+Now we build a projection matrix A that projects the spatio-temporal
+continuous Gaussian random field from the observations to the mesh
+nodes.
+
+```{r}
+coo <- data_model %>%
+  st_drop_geometry() %>%
+  dplyr::select(Xgd, Ygd)
+
+group <- data_model$year - min(data_model$year) + 1
+A <- inla.spde.make.A(mesh = mesh_GdG, 
+                      # must be a matrix
+                      loc = coo %>%
+                        as.matrix(), 
+                      group = group
+                      )
+
+```
+
+
+# Prepare the prediction for Gaussian field
+```{r}
+grille_pred <- sf::st_read("C:/Users/ahebertb/Desktop/StageAurel/20230724_envdata_bob.gpkg", layer = "2021")
+
+grille_pred <- grille_pred %>% st_transform(., 4326) %>% 
+  filter(season == "summer")
+  
+ggplot(grille_pred)+geom_sf()
+
+coord_pred <- grille_pred %>% st_centroid(.) %>% st_coordinates(.)
+
+A_pred <- inla.spde.make.A(mesh = mesh_GdG, 
+                      # must be a matrix
+                      loc = coord_pred %>%
+                        as.matrix(), 
+                      group = sn*timesn,
+                      )
+  
+```
+
+
+
+# Stack with data 
+
+```{r}
+# standardize covariates
+std <- function(x, xref = NULL) {
+  if(is.null(xref)) {
+    out <- (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  } else {
+    out <- (x - mean(xref, na.rm = TRUE)) / sd(xref, na.rm = TRUE)
+  }
+  return(out)
+}
+
+#stack
+stk.z  <- inla.stack(
+  data = list(Y = cbind(as.vector(data_model$indice), NA, NA), e = data_model$weight , link = 1), 
+  A = list(A, 1),
+  effects = list(c(field.z.idx, field.zc.idx), 
+                 z.intercept = rep(1, nrow(data_model))
+  ),
+  tag = 'occ'
+) 
+
+stk.y <- inla.stack(
+  data = list(Y = cbind(NA, as.vector(data_model$biomass),NA), e = data_model$weight, link = 2),
+  A = list(A, 1),
+  effects = list(c(field.y.idx, field.zc.idx), 
+                 y.intercept = rep(1, nrow(data_model))
+  ), 
+  tag = 'dens'
+) 
+
+stk.p <- inla.stack(
+  data = list(Y = cbind(NA, NA, as.vector(data_model$presence)), e = data_model$weight, link = 3),
+  A = list(A, 1),
+  effects = list(c(field.p.idx, field.zc.idx), 
+                 p.intercept = rep(1, nrow(data_model))
+  ), 
+  tag = 'pres'
+)
+
+#stack prediction
+empty.pred <- rep(NA, length(coord_pred)/2)
+
+stk.z.pred <- inla.stack(
+  data = list(Y = cbind(empty.pred, NA, NA),
+              e = rep(1, length(coord_pred)/2), link = 1), 
+  A = list(A_pred, 1),
+  effects = list(c(field.z.idx, field.zc.idx), 
+                 z.intercept = rep(1, nrow(A_pred))
+  ),
+  tag = 'occ.pred'
+) 
+
+stk.y.pred <- inla.stack(
+  data = list(Y = cbind(NA, empty.pred, NA),
+              e = rep(1, length(coord_pred)/2), link = 2),
+  A = list(A_pred, 1),
+  effects = list(c(field.y.idx, field.zc.idx), 
+                 y.intercept = rep(1, nrow(A_pred))
+  ), 
+  tag = 'dens.pred'
+) 
+
+stk.p.pred <- inla.stack(
+  data = list(Y = cbind(NA, NA, empty.pred), e = rep(0, length(coord_pred)/2), link = 3),
+  A = list(A_pred, 1),
+  effects = list(c(field.p.idx, field.zc.idx), 
+                 p.intercept = rep(1, nrow(A_pred))
+  ), 
+  tag = 'pres.pred'
+)
+
+stk.all <- inla.stack(stk.z, stk.y, stk.p,
+                      stk.z.pred, stk.y.pred, stk.p.pred)
+```
+
+# temporal autoregressive parameter
+```{r}
+h.spec <- list(rho = list(prior = 'pc.cor1', param = c(0, 0.9)))
+```
+control.group = list(model = "ar1", hyper = rprior) specifes that across time, the process evolves according to an AR(1) process where the prior for the autocorrelation parameter a is given by rprior. We define rprior with the prior "pccor1" which is a PC prior for the autocorrelation parameter a where a=1 is the base model. Here we assume P(a>0)=0.9.
+
+# Prior
+```{r}
+#intercept prior
+prior.fixed <- list(mean.intercept = 0.0, prec.intercept = 1 / (log(10) / 2)^2, mean = 0.0, prec = 1 / (log(5) / 2)^2) 
+
+cinla <- list(strategy = 'simplified.laplace', int.strategy = 'eb',  control.vb=list(emergency= 30))
+
+bprior <- list(prior = 'gaussian', param = c(0, 1))
+```
+For the shared parameter β we can set a prior based on some knowledge about the correlation between the rain occurrence and the rainfall amount. We assume a N(0, 1) prior for the bprior.
+
+#Model formula
+
+```{r}
+formula.joint <- Y ~ -1 + 
+    z.intercept + y.intercept + p.intercept +
+    f(x, model = spde, group = x.group, control.group = list(model = "iid")) + #binom field
+    f(xc, model = spde, fixed = FALSE, #hyper = list(beta = bprior), 
+      group = xc.group,
+      control.group = list(model = 'ar1', hyper = h.spec)) + #shared field
+    f(u, model = spde, group = u.group, control.group = list(model = "iid")) + #gamma field
+    f(p, model = spde, group = p.group, control.group = list(model = "iid")) #PPP field
+
+```
+We can define the model formula for the model specified. We use the spde object to define the model of the space-time component together with the definition of the prior for the AR(1) temporal dynamics. In order to define the β parameter of the shared space-time component we set fixed = FALSE to estimate β and insert its prior.
+
+
+# inla() call
+```{r}
+res.jo <- inla(formula.joint, family = c("binomial", "lognormal", "poisson"), 
+  data = inla.stack.data(stk.all), 
+  control.predictor = list(A = inla.stack.A(stk.all), link = link, compute = TRUE),
+  control.compute = list(dic = FALSE, waic = TRUE, cpo = TRUE,
+    config = TRUE, residuals = TRUE), control.inla = cinla, control.fixed = prior.fixed, 
+  verbose = TRUE, E = inla.stack.data(stk.all)$e)
+
+```
+
+# Show the result
+```{r}
+summary(res.jo)
+
+saveRDS(res.jo, file = paste(local_path,"/code/model/result_anch_spring_894",".rds", sep = ""))
+res.jo <- readRDS(paste(local_path,"/code/model/result_anch_spring_894",".rds", sep = ""))
+
+res.jo$mode$mode.status 
+```

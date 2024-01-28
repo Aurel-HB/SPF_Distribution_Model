@@ -1,0 +1,203 @@
+---
+title: "Model_Pelgas"
+output: html_document
+date: "2023-04-25"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+All the syntax starting with a \# in a chunk do not run
+
+We prepare the data we will use in this code
+
+```{r}
+grid_projection <- "+proj=longlat +datum=WGS84" #grid_projection is a valid CRS specification in the PROJ.4 format
+
+load("C:/Users/ahebertb/Desktop/StageAurel/code_florian/mesh_GdG.Rdata")
+load("C:/Users/ahebertb/Desktop/StageAurel/code_florian/study_domain_sp.RData")
+
+
+```
+
+#To use the crs() function, you first need to convert your
+study_domain_sp object to an sf object. \# Convert study_domain_sp to an
+sf object
+
+```{r}
+study_domain_sf <- st_as_sf(study_domain_sp)
+st_crs(study_domain_sf) <- 4326
+world <- ne_download(scale = 10, type = 'countries', returnclass = "sf")
+ggplot(study_domain_sf)+geom_sf()+theme_bw()
+```
+
+# Importation of the data
+
+```{r}
+path_data <- "C:/Users/ahebertb/Desktop/StageAurel/code/data/tidy/"
+sard_PEL_2018 <- readRDS(paste(path_data,"sard_2018_PEL.RDS",sep = ""))
+SST_2018 <- readRDS(paste(path_data,"SST_2018.RDS",sep = ""))
+```
+
+# First transformation of the Pelgas dataset
+
+```{r}
+df.sard_PEL_2018 <- st_as_sf(sard_PEL_2018, coords = c("LONG","LAT"))
+st_crs(df.sard_PEL_2018) <- 4326
+
+df.SST_2018 <- st_as_sf(SST_2018, coords = c("long","lat"))
+st_crs(df.SST_2018) <- 4326
+```
+
+# We want to keep the data of the domain of study
+
+```{r}
+location <- st_intersects(study_domain_sf,df.sard_PEL_2018)
+obs <- sard_PEL_2018[location[[1]],]
+for (polygon in (2:length(location))){
+  obs <- rbind(obs,sard_PEL_2018[location[[polygon]],])
+}
+
+
+ggplot(study_domain_sf)+geom_sf()+
+  geom_point(data = obs, aes(x = LONG, y = LAT), size = 0.5)+theme_bw()
+
+
+
+location <- st_intersects(study_domain_sf,df.SST_2018)
+sst <- SST_2018[location[[1]],]
+for (polygon in (2:length(location))){
+  sst <- rbind(sst,SST_2018[location[[polygon]],])
+}
+
+sst <- (cbind(sst$long, sst$lat, sst[,7], rep(2018,143)))
+sst <- as.data.frame(sst)
+names(sst) <- c("Xgd","Ygd","SST","Year")
+
+sst$Xgd <- as.numeric(sst$Xgd)
+sst$Ygd <- as.numeric(sst$Ygd)
+sst$SST <- as.numeric(sst$SST)
+sst$Year <- as.numeric(sst$Year)
+
+
+ggplot(study_domain_sf)+geom_sf()+
+  geom_point(data = sst, aes(x = Xgd, y = Ygd), size = 0.5)+theme_bw()
+
+```
+
+# We want associate all the data of the domain of study
+```{r}
+path_map <- paste(path.output,"fusion/sard/",sep = "")
+source(paste(path_function,"prepare_grid_pel_jun.R",sep = ""))
+
+Grid2 <- mosaic_gridDataframe(obs,"year", 
+                               path_map,"indice",
+                                "indice")
+Grid2 <- Grid2 %>% mutate( presence = Zvalue)
+#the grid is used to concatenate the value of Pelgas 
+
+df <- merge(sst,Grid2,by=c("Xgd","Ygd","Year"))
+
+```
+
+
+
+# Mesh construction
+
+We compare a random mesh contruction with the mesh_GdG of Florian's work
+
+```{r}
+coo <- cbind(df$Xgd,df$Ygd)
+
+#it's a try of my own mesh to check how it work
+bnd <- inla.nonconvex.hull(st_coordinates(study_domain_sf))
+mesh <- inla.mesh.2d(loc = coo, boundary = bnd,
+  cutoff=0.11,
+  max.edge=c(0.1,0.45),min.angle=c(21,21),crs = grid_projection
+)
+
+plot(mesh)
+
+plot(mesh_GdG)
+points(coo, col = "red")
+
+plot(mesh_GdG)
+points(cbind(sst$Xgd,sst$Ygd), col = "red")
+```
+
+For the model we choose the mesh_GdG to allow comparaison
+
+# Building the SPDE model on the mesh
+
+Now we use the inla.spde2.pcmatern() function to build the SPDE model
+and specify Penalised Complexity priors for the parameters of the Matérn
+field.
+
+```{r}
+spde <- inla.spde2.pcmatern(
+  mesh = mesh_GdG,
+  prior.range=c(0.01,0.1),
+  prior.sigma=c(100,0.1)
+)
+#les paramètres sont ceux de Florian
+```
+
+# Index set
+
+Now we construct the index set for the latent spatio-temporal Gaussian
+model
+
+```{r}
+timesn <- length(unique(df$Year))
+indexs <- inla.spde.make.index(
+  "s", n.spde = spde$n.spde, n.group = timesn
+)
+lengths(indexs)
+```
+
+# Projection matrix
+
+Now we build a projection matrix A that projects the spatio-temporal
+continuous Gaussian random field from the observations to the mesh
+nodes.
+
+```{r}
+group <- df$Year - min(df$Year) + 1
+A <- inla.spde.make.A(mesh = mesh_GdG, loc = coo, group = group)
+```
+
+
+# Stack with data 
+
+```{r}
+stk.pres <- inla.stack(
+  tag = "occdata",
+  data = list(y = df$presence),
+  A = list(1,A),
+  effects = list( t=df$SST, s=indexs)
+)
+
+
+```
+
+#Model formula
+
+```{r}
+rprior <- list(theta =list(prior = "pc.cor1", param = c(0, 0.9)))
+
+formula <- y ~ 0 + t + f(s, model = spde, group = group,
+                         control.group = list(model = "ar1", hyper = rprior))
+```
+
+# inla() call
+```{r}
+
+res <- inla(formula, family = c("binomial"), 
+  data = inla.stack.data(stk.pres), 
+  control.predictor = list(compute = TRUE, A = inla.stack.A(stk.pres)),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,
+    config = TRUE)
+  )
+```
+
+

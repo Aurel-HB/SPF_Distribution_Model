@@ -1,0 +1,224 @@
+---
+title: "Application_pelgas"
+output: html_document
+date: "2023-04-13"
+---
+# First model using `inlabru`
+
+One of the primary functions of `inlabru` is the `lgcp` function. Below, we provide detailed steps for building a Log-Gaussian Cox Process (LGCP) using the Pl\@ntNet data.
+
+
+```{r}
+library(ggplot2)
+library(ggpolypath)
+library(INLA)
+library(inlabru)
+library(raster)
+library(rgeos)
+library(sf)
+library(tidyverse)
+library(viridis)
+
+#load the data needed
+load("C:/Users/ahebertb/Desktop/StageAurel/code_florian/study_domain_sp.RData") 
+
+
+```
+
+## Choose a species of study
+
+We begin by selecting species of interest. It's worth noting that when calling the `lgcp` function, the coordinates must be named "x" and "y," and the data must be in the `SpatialPointsDataFrame` (spdf) format of the `sp` package.
+
+
+```{r}
+
+
+# Load data already filter by the name of the studied species
+assign(paste('sard_PEL_tot'), readRDS(paste(path_data,"Data_sard_PEL",".rds",sep = "")))
+sard_PEL_tot <- sard_PEL_tot %>% filter(year == "2019")
+
+# Convert the df to a spdf
+Sard_spdf <- 
+  SpatialPointsDataFrame(coords = sard_PEL_tot[,c("LONG", "LAT")], 
+                         data = sard_PEL_tot, 
+                         proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+# Plot of the domain with the observation points
+ggplot() + geom_sf(data=st_as_sf(study_domain_sp)) + 
+  geom_sf(data = st_as_sf(Sard_spdf), color = 2) +
+  labs(title = "Observations of Ostrya carpinifolia (red)") +
+  theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+```
+
+## Build a mesh with INLA to implement spatial Gaussian fields
+
+`INLA` and `inlabru` use a space triangulation method to estimate spatial Gaussian effects with a Matérn covariance function. The spatial Gaussian random field is computed at the mesh nodes by resolving a Stochastic Partial Differential Equation (SPDE), while it is computed elsewhere by interpolation. The mesh definition is based on a trade-off between the finer spatial scale of the spatial effect (higher resolution) and the number of nodes (lower resolution). Below, we present how to build a mesh from the data.
+
+First, we create a matrix `coordDOM` with regular coordinates of the spatial domain. Next, we define the boundaries of the domain used for computing the spatial latent effect with the SPDE approach. Generally, we compute an internal boundary and an external boundary with different resolutions to address boundary effects.
+
+The `inla.mesh.2d` function creates a triangle mesh based on initial point locations, specified or automatic boundaries, and mesh quality parameters.
+
+```{r}
+#| warning: false
+
+# Regularly sample 1000 points in the domain polygon
+tmp = spsample(study_domain_sp@polygons[[1]], n = 1000, type = "regular")
+
+# Coordinates to build the mesh
+coordDOM <- tmp@coords
+for (chiffre in seq(1,14,1)){
+  coordDOM <- rbind(coordDOM,study_domain_sp@polygons[[chiffre]]@Polygons[[1]]@coords)
+}
+
+rm(tmp)
+
+# Boundaries
+bndint <- inla.nonconvex.hull(coordDOM, convex=-.05)
+bndext <- inla.nonconvex.hull(coordDOM, convex=-.3)
+
+# Plot the domain and the boundaries
+par(mar=rep(1,4),mfrow=c(1,1))
+plot(rbind(bndext$loc,bndext$loc[1,]),type="l",lwd=2)
+lines(rbind(bndint$loc, bndint$loc[1,]), pch = 19, cex = .05, col = "red", 
+      lwd = 1, lty=2)
+plot(study_domain_sp,add=T,border=4)
+
+# Use of inla.mesh.2d 
+mesh = inla.mesh.2d(loc=rbind(coordinates(Sard_spdf)),# interessant que si tu veux observation passe par noeud
+                    boundary = list(int = bndint, out = bndext), 
+                    max.edge = c(25, 100),
+                    crs = "+proj=lcc +lat_0=42 +lon_0=3 +lat_1=49 +lat_2=44 
+                    +x_0=700000 +y_0=6600000 +ellps=GRS80 +units=km +no_defs"
+                    )
+
+#Florian's code
+grid_projection <- "+proj=longlat +datum=WGS84"
+bound  = inla.nonconvex.hull(coordDOM,convex=-.005)
+bound2 = inla.nonconvex.hull(coordDOM,convex=-.125)
+# Define minimum edge length as 10km and maximum edge length as 25km 
+# (within the study region) and 50km (in the extension zone).
+mesh=inla.mesh.2d(boundary=list(bound,bound2), # loc=unique(xy_OBS),
+                  cutoff=.11,
+                  max.edge=c(.1,0.45),min.angle=c(21,21),crs = grid_projection)
+
+print(c("Number of mesh:", mesh$n))
+plot(mesh, asp = 1, xlab = "x (1000 km)", ylab = "y (1000 km)") #looks OK
+lines(fr$x,fr$y,lwd=2,col="red") #add the true boundary of France in red
+
+
+
+
+# Number of nodes of the mesh
+mesh$n
+
+load("C:/Users/ahebertb/Desktop/StageAurel/code_florian/mesh_GdG.RData")
+
+# Plot the mesh
+par(mar=rep(1,4),mfrow=c(1,1))
+plot(mesh_GdG, main = "", asp = 1)
+plot(Sard_spdf,add=T,col=4,pch=16,cex=0.5)
+#plot(PO_Senecio_inaequidens,add=T,col=2,pch=16,cex=0.5)
+plot(study_domain_sp,add=T,border=1,lwd=2)
+```
+## How to fit the model
+
+Our first generic LGCP model concerns the spatial distribution of the species *Ostrya carpinifolia* using presence-only data. We model the intensity of the studied species $i$ at the point $s$ as follows:
+
+$$ \ln\left( \Lambda_i(s) \right) = \underbrace{\alpha_i}_{\text{Intercept}} + \underbrace{ x(s)}_{\text{Elevation}}\beta_i + \underbrace{W_i(s)}_{\text{Gaussian field}} $$
+The linear predictor $\ln(\Lambda_i)$ captures a linear effect of elevation through $\beta_i$, while the Gaussian random field $W_i$ represents an unmeasured covariate associated with the species' distribution.
+
+We choose the Matérn covariance function for the Gaussian random field because it can be easily fitted in `INLA` using a SPDE. The Matérn covariance in `INLA` depends on three parameters: a fractional order parameter *alpha* in the SPDE linked to the smoothness of the solution, a standard deviation parameter *sigma*, and a spatial correlation parameter known as the *range*. We specify these parameters in our model by selecting a penalized complexity prior using the `inla.spde2.pcmatern` function. For more details, please refer to the introduction to spatial models with `INLA` in chapter 7 at <https://becarioprecario.bitbucket.io/inla-gitbook/ch-spatial.html>.
+
+```{r}
+#| output: false
+matern <- inla.spde2.pcmatern(mesh,
+                              alpha = 2, # fractional operator which is related 
+                              #to the smoothness of the Gaussian field
+                              prior.sigma = c(1, 0.5), # P(sigma > 1) = 0.5
+                              prior.range = c(100, 0.9)) # P(range < 100) = 0.9
+```
+
+We then specify, in `cmp`, the formulation of the model with all the variables and covariates involved, such as the coordinates of our observations, in relation to all the latent effects, including an intercept and the Gaussian random field.
+
+```{r}
+cmp <- coordinates ~ Intercept(1)+
+  W1(coordinates, model = matern)
+```
+
+Finally, we fit the Log-Gaussian Cox Process to the data using the `lgcp` function of the `inlabru` package. This function requires the model components defined earlier (`cmp`), the dataset (`sard_PEL_tot`), the spatial domain where the data were collected (`study_domain_sp`), the mesh (`mesh`) where the model will be evaluated, and several options to control the INLA algorithm.
+
+```{r}
+#| warning: false
+
+
+T1 <- Sys.time()
+fit <- lgcp(cmp, PO_Ostrya_carpinifolia,
+            samplers = domaineSP,
+            domain = list(coordinates = mesh),
+            options = list(control.inla = list(int.strategy = "eb")))
+T2 <- Sys.time()
+
+fit1 = fit  # keep the output
+summary(fit)
+Tdiff= difftime(T2, T1) ; Tdiff
+```
+
+
+#########
+Le travail de Prediction fait pour le modèle Pelgas 2018
+# Prediction data
+
+Now we construct the data with the locations and times where we want to
+make predictions.
+
+```{r}
+bb <- st_bbox(study_domain_sf)
+x <- seq(bb$xmin - 1, bb$xmax + 1, length.out = 50)
+y <- seq(bb$ymin - 1, bb$ymax + 1, length.out = 50)
+dp <- as.matrix(expand.grid(x,y))
+plot(dp, asp = 1)
+```
+
+Then we keep only the location of the bay of biscay
+
+```{r}
+p <- st_as_sf(data.frame(x = dp[,1], y = dp[,2]), coords = c("x","y"))
+st_crs(p) <- st_crs(grid_projection)
+ind <- st_intersects(study_domain_sf, p)
+#Because the study_domain_sf is construct in 14 polygon 
+# we do a loop to put all the point in 1 dataset
+final_matrix <- dp[ind[[1]],]
+for (polygon in (2:length(ind))){
+  final_matrix <- rbind(final_matrix,dp[ind[[polygon]],])
+}
+plot(final_matrix, asp = 1)
+```
+
+Now we construct the data that includes the coordinates and the three
+times by repeating final_matrix three times and adding a column denoting
+the times.
+
+```{r}
+dp <- data.frame(c(),c(),c())
+for (time in 1:max(group)){
+  dp <- rbind(dp, cbind(final_matrix, time)) 
+}
+dp <- as.matrix(dp)
+head(dp)
+```
+
+Finally, we also construct the matrix Ap that projects the spatially
+continuous Gaussian random fiel from the prediction
+locations to the mesh nodes.
+
+```{r}
+coo.sp <- dp[,1:2]
+group.sp <- dp[, 3]
+A.sp <- inla.spde.make.A(mesh = mesh_GdG, loc = coo.sp, group = group.sp)
+```
+
+
+
+
+
+
